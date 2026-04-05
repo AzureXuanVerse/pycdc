@@ -1689,6 +1689,19 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
         case Pyc::POP_EXCEPT:
             /* Do nothing. */
             break;
+        case Pyc::PUSH_EXC_INFO:
+            /* Python 3.11+: pushes exception info tuple. We ignore here to keep decompilation going. */
+            break;
+        case Pyc::CHECK_EXC_MATCH:
+            {
+                /* Python 3.11+: compares exception against handler type. */
+                PycRef<ASTNode> right = stack.top();
+                stack.pop();
+                PycRef<ASTNode> left = stack.top();
+                stack.pop();
+                stack.push(new ASTCompare(left, right, ASTCompare::CMP_EXCEPTION));
+            }
+            break;
         case Pyc::END_FOR:
             {
                 stack.pop();
@@ -1830,6 +1843,14 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 }
             }
             break;
+        case Pyc::RERAISE:
+        case Pyc::RERAISE_A:
+            {
+                /* Re-raise current exception; treat like 'raise' without args. */
+                ASTRaise::param_t paramList;
+                curblock->append(new ASTRaise(paramList));
+            }
+            break;
         case Pyc::RETURN_VALUE:
         case Pyc::INSTRUMENTED_RETURN_VALUE_A:
             {
@@ -1919,6 +1940,9 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 blocks.push(withblock);
                 curblock = blocks.top();
             }
+            break;
+        case Pyc::BEFORE_WITH:
+            /* Python 3.11: setup for with block; ignore. */
             break;
         case Pyc::WITH_CLEANUP:
         case Pyc::WITH_CLEANUP_START:
