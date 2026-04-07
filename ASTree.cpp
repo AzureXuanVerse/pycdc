@@ -93,6 +93,12 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
     bool else_pop = false;
     bool need_try = false;
     bool variable_annotations = false;
+    std::vector<PycExceptionTableEntry> exception_entries;
+    size_t next_exception_entry = 0;
+
+    if (mod->verCompare(3, 11) >= 0) {
+        exception_entries = code->exceptionTableEntries();
+    }
 
     while (!source.atEof()) {
 #if defined(BLOCK_DEBUG) || defined(STACK_DEBUG)
@@ -107,6 +113,84 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
     #endif
         fprintf(stderr, "\n");
 #endif
+
+        while (next_exception_entry < exception_entries.size()
+                && exception_entries[next_exception_entry].start_offset < pos) {
+            next_exception_entry++;
+        }
+
+        if (next_exception_entry < exception_entries.size()) {
+            const auto& entry = exception_entries[next_exception_entry];
+            if (entry.start_offset == pos
+                    && entry.stack_depth == 0
+                    && !entry.push_lasti) {
+                if (curblock->blktype() == ASTBlock::BLK_CONTAINER) {
+                    curblock.cast<ASTContainerBlock>()->setExcept(entry.target);
+                } else {
+                    PycRef<ASTBlock> next = new ASTContainerBlock(0, entry.target);
+                    blocks.push(next.cast<ASTBlock>());
+                    curblock = blocks.top();
+                }
+
+                stack_hist.push(stack);
+                PycRef<ASTBlock> tryblock = new ASTBlock(ASTBlock::BLK_TRY, entry.target, true);
+                blocks.push(tryblock.cast<ASTBlock>());
+                curblock = blocks.top();
+                next_exception_entry++;
+            }
+        }
+
+        if (curblock->blktype() == ASTBlock::BLK_TRY
+                && curblock->end() == pos
+                && blocks.size() > 1) {
+            PycRef<ASTBlock> prev = curblock;
+            blocks.pop();
+            curblock = blocks.top();
+
+            if (curblock->blktype() == ASTBlock::BLK_CONTAINER
+                    && curblock.cast<ASTContainerBlock>()->hasExcept()) {
+                if (!stack_hist.empty()) {
+                    stack = stack_hist.top();
+                    stack_hist.pop();
+                }
+
+                curblock->append(prev.cast<ASTNode>());
+                stack_hist.push(stack);
+
+                PycRef<ASTBlock> except = new ASTCondBlock(ASTBlock::BLK_EXCEPT, 0, NULL, false);
+                except->init();
+                blocks.push(except);
+                curblock = blocks.top();
+            } else {
+                blocks.push(prev);
+                curblock = prev;
+            }
+        }
+
+        if (curblock->blktype() == ASTBlock::BLK_EXCEPT
+                && curblock->end() == pos
+                && blocks.size() > 1) {
+            PycRef<ASTBlock> prev = curblock;
+            blocks.pop();
+            curblock = blocks.top();
+
+            if (!stack_hist.empty()) {
+                stack = stack_hist.top();
+                stack_hist.pop();
+            }
+
+            if (prev->size() != 0) {
+                curblock->append(prev.cast<ASTNode>());
+            }
+
+            if (curblock->blktype() == ASTBlock::BLK_CONTAINER
+                    && !curblock.cast<ASTContainerBlock>()->hasFinally()) {
+                PycRef<ASTBlock> cont = curblock;
+                blocks.pop();
+                curblock = blocks.top();
+                curblock->append(cont.cast<ASTNode>());
+            }
+        }
 
         curpos = pos;
         bc_next(source, mod, opcode, operand, pos);
@@ -1093,15 +1177,17 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
 
                 if (cond.type() == ASTNode::NODE_COMPARE
                         && cond.cast<ASTCompare>()->op() == ASTCompare::CMP_EXCEPTION) {
+                    int except_end = offs;
                     if (curblock->blktype() == ASTBlock::BLK_EXCEPT
                             && curblock.cast<ASTCondBlock>()->cond() == NULL) {
+                        except_end = curblock->end();
                         blocks.pop();
                         curblock = blocks.top();
 
                         stack_hist.pop();
                     }
 
-                    ifblk = new ASTCondBlock(ASTBlock::BLK_EXCEPT, offs, cond.cast<ASTCompare>()->right(), false);
+                    ifblk = new ASTCondBlock(ASTBlock::BLK_EXCEPT, except_end, cond.cast<ASTCompare>()->right(), false);
                 } else if (curblock->blktype() == ASTBlock::BLK_ELSE
                            && curblock->size() == 0) {
                     /* Collapse into elif statement */
@@ -1370,8 +1456,10 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                     } else if (prev->blktype() == ASTBlock::BLK_TRY
                             && prev->end() < pos+offs) {
                         /* Need to add an except/finally block */
-                        stack = stack_hist.top();
-                        stack.pop();
+                        if (!stack_hist.empty()) {
+                            stack = stack_hist.top();
+                            stack_hist.pop();
+                        }
 
                         if (blocks.top()->blktype() == ASTBlock::BLK_CONTAINER) {
                             PycRef<ASTContainerBlock> cont = blocks.top().cast<ASTContainerBlock>();
@@ -1689,6 +1777,19 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
         case Pyc::POP_EXCEPT:
             /* Do nothing. */
             break;
+        case Pyc::PUSH_EXC_INFO:
+            /* Python 3.11+: pushes exception info tuple. We ignore here to keep decompilation going. */
+            break;
+        case Pyc::CHECK_EXC_MATCH:
+            {
+                /* Python 3.11+: compares exception against handler type. */
+                PycRef<ASTNode> right = stack.top();
+                stack.pop();
+                PycRef<ASTNode> left = stack.top();
+                stack.pop();
+                stack.push(new ASTCompare(left, right, ASTCompare::CMP_EXCEPTION));
+            }
+            break;
         case Pyc::END_FOR:
             {
                 stack.pop();
@@ -1830,6 +1931,10 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 }
             }
             break;
+        case Pyc::RERAISE:
+        case Pyc::RERAISE_A:
+            /* Python 3.11 cleanup opcode. */
+            break;
         case Pyc::RETURN_VALUE:
         case Pyc::INSTRUMENTED_RETURN_VALUE_A:
             {
@@ -1919,6 +2024,9 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 blocks.push(withblock);
                 curblock = blocks.top();
             }
+            break;
+        case Pyc::BEFORE_WITH:
+            /* Python 3.11: setup for with block; ignore. */
             break;
         case Pyc::WITH_CLEANUP:
         case Pyc::WITH_CLEANUP_START:
